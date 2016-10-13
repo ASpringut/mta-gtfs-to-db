@@ -48,7 +48,6 @@ def save_feed_data(feed_message, dbconn):
                                                   stopid=stu.stop_id,
                                                   arrivalTime=stu.arrival.time,
                                                   departureTime=stu.departure.time)
-                      
                     dbconn.execute(fstatement)
                 
 def parse_and_save(dbconn, file_list):
@@ -67,9 +66,19 @@ def create_database():
     cursor = c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='stops';")
     f = cursor.fetchone()
     if f is None:
-        c.execute("""CREATE TABLE trips (id INTEGER PRIMARY KEY AUTOINCREMENT, tripid TEXT)""")
-        c.execute("""CREATE TABLE stations (id INTEGER PRIMARY KEY,, stopid TEXT)""")
-        c.execute('''CREATE TABLE stops (routeid f, direction text, FOREIGN KEY(tripid) REFERENCES trips(id), stopid text, arrivalTime int, departureTime int, PRIMARY KEY(routeid, direction, tripid, stopid))''')
+        c.execute('''CREATE TABLE trips (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                         tripid TEXT)''')
+        c.execute('''CREATE TABLE stations (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                            stationid TEXT)''')
+        c.execute('''CREATE TABLE stops (routeid f,
+                                        direction TEXT,
+                                        tripid INTEGER,
+                                        stationid INTEGER,
+                                        arrivalTime INTEGER,
+                                        departureTime INTEGER,
+                                        FOREIGN KEY(tripid) REFERENCES trips(id),
+                                        FOREIGN KEY(stationid) REFERENCES stations(id),
+                                        PRIMARY KEY(routeid, direction, stationid))''')
         c.commit()
     return c
             
