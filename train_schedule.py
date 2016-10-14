@@ -8,6 +8,10 @@ from multiprocessing import Process
 from pprint import pprint as pp
 from google.protobuf.message import DecodeError
 
+#global sets of stations and trips
+trips = set()
+stations = set()
+
 def read_proto_list(dir):
     list = os.listdir(dir)
     file_list = [os.path.join(dir,f) for f in list]
@@ -36,20 +40,56 @@ def multiprocess_parse(file_list):
     return result
     
 def save_feed_data(feed_message, dbconn):
+    global trips
+    global stations
+    stops = []
+    #sets of new 
+    new_trips = set()
+    new_stations = set()
     for entity in feed_message.entity:
         if entity.HasField("trip_update"):
             trip_update = entity.trip_update
             for stu in trip_update.stop_time_update:
                 if stu.HasField("arrival") and stu.HasField("departure"):
-                    statement = "INSERT OR IGNORE INTO stops VALUES (\"{routeid}\", \"{direction}\", \"{tripid}\", \"{stopid}\", {arrivalTime}, {departureTime});"
-                    fstatement = statement.format(routeid=trip_update.trip.route_id,
-                                                  direction=trip_update.trip.Extensions[subway_pb2.nyct_trip_descriptor].direction,
-                                                  tripid=trip_update.trip.trip_id,
-                                                  stopid=stu.stop_id,
-                                                  arrivalTime=stu.arrival.time,
-                                                  departureTime=stu.departure.time)
-                    dbconn.execute(fstatement)
-                
+                    trip = trip_update.trip.trip_id
+                    station = stu.stop_id
+                    #add it list of newly discovered items if not previously discovered
+                    if trip not in trips:
+                        new_trips.add(trip)
+                    if not station in stations:
+                        new_stations.add(station)
+                    stops.append((trip_update.trip.route_id,
+                                  trip_update.trip.Extensions[subway_pb2.nyct_trip_descriptor].direction,
+                                  trip_update.trip.trip_id,
+                                  stu.stop_id,
+                                  stu.arrival.time,
+                                  stu.departure.time))
+
+    #insert new trips and stations before stops so that we have all required foreign keys
+    insert_new_trips(new_trips,dbconn)
+    insert_new_stations(new_stations,dbconn)
+    #add the newly discovered trips and stations to the global list
+    stations = stations | new_stations
+    trips = trips | new_trips
+
+    statement = '''INSERT OR IGNORE INTO stops (routeid, direction, tripid, stationid, arrivaltime, departuretime) 
+                                        VALUES (?, ?, ?, ?, ?, ?);'''
+    dbconn.executemany(statement, stops)
+    dbconn.commit()
+
+
+def insert_new_trips(new_trips, dbconn):
+    insert_trips = [(val,) for val in new_trips]
+    dbconn.executemany("INSERT INTO trips (tripid) VALUES (?)", insert_trips)
+    dbconn.commit()
+
+def insert_new_stations(new_stations, dbconn):
+    insert_stations = [(val,) for val in new_stations]
+
+    dbconn.executemany("INSERT INTO stations (stationid) VALUES (?)", insert_stations)
+    dbconn.commit()
+
+
 def parse_and_save(dbconn, file_list):
     feed_messages = multiprocess_parse(file_list)
     for i,message in enumerate(feed_messages):
@@ -57,6 +97,8 @@ def parse_and_save(dbconn, file_list):
             save_feed_data(message, dbconn)
             print("write file", i)
     dbconn.commit()
+    print(trips)
+    print(stations)
     print("done")
 
         
@@ -67,9 +109,9 @@ def create_database():
     f = cursor.fetchone()
     if f is None:
         c.execute('''CREATE TABLE trips (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                         tripid TEXT)''')
+                                          tripid TEXT UNIQUE)''')
         c.execute('''CREATE TABLE stations (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                            stationid TEXT)''')
+                                             stationid TEXT UNIQUE)''')
         c.execute('''CREATE TABLE stops (routeid f,
                                         direction TEXT,
                                         tripid INTEGER,
@@ -78,7 +120,7 @@ def create_database():
                                         departureTime INTEGER,
                                         FOREIGN KEY(tripid) REFERENCES trips(id),
                                         FOREIGN KEY(stationid) REFERENCES stations(id),
-                                        PRIMARY KEY(routeid, direction, stationid))''')
+                                        PRIMARY KEY(routeid, direction, stationid, tripid))''')
         c.commit()
     return c
             
@@ -87,7 +129,6 @@ if __name__ == "__main__":
     #calculate data over time
     conn = create_database()
     dir  = "E:\\subway data\\sep\\"
-    exit()
     plist = read_proto_list(dir)[:100]
     parse_and_save(conn, plist)
     
