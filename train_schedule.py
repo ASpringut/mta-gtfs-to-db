@@ -6,16 +6,9 @@ import sqlite3
 import multiprocessing as mp
 from multiprocessing import Process
 from pprint import pprint as pp
+import queue
 from google.protobuf.message import DecodeError
-
-#global sets of stations and trips
-trips = set()
-stations = set()
-
-def read_proto_list(dir):
-    list = os.listdir(dir)
-    file_list = [os.path.join(dir,f) for f in list]
-    return file_list
+import re
       
 def parse_proto(file):
     with open(file,'rb') as f:
@@ -26,91 +19,111 @@ def parse_proto(file):
             return feed_message
         except DecodeError as e:
             return None
+        except UnicodeDecodeError:
+            return None
 
-        
-def multiprocess_parse(file_list):
-    #read all the files into the queue
-    q = mp.Queue()
-    for p in plist:
-        q.put(p)
-      
-    p = mp.Pool(8)
-    result = p.map(parse_proto, file_list)
-    p.terminate()
-    return result
-    
-def save_feed_data(feed_message, dbconn):
-    global trips
-    global stations
-    stops = []
-    #sets of new 
-    new_trips = set()
-    new_stations = set()
-    for entity in feed_message.entity:
+#take a protobuf, returns a tuple of  
+#(routeid, direction, tripid, stationid, arrivaltime, departuretime)
+#for each of the stops in the message
+#these are the only things we care about right now
+def proto_to_tuple_list(protobuf):
+    tuple_list= []
+    for entity in protobuf.entity:
         if entity.HasField("trip_update"):
             trip_update = entity.trip_update
             for stu in trip_update.stop_time_update:
                 if stu.HasField("arrival") and stu.HasField("departure"):
-                    trip = trip_update.trip.trip_id
-                    station = stu.stop_id
-                    #add it list of newly discovered items if not previously discovered
-                    if trip not in trips:
-                        new_trips.add(trip)
-                    if not station in stations:
-                        new_stations.add(station)
-                    stops.append((trip_update.trip.route_id,
-                                  trip_update.trip.Extensions[subway_pb2.nyct_trip_descriptor].direction,
-                                  trip_update.trip.trip_id,
-                                  stu.stop_id,
-                                  stu.arrival.time,
-                                  stu.departure.time))
+                    strip_id =  strip_stop_pattern_from_tripid(trip_update.trip.trip_id)
+                    tup = (trip_update.trip.route_id,
+                              trip_update.trip.Extensions[subway_pb2.nyct_trip_descriptor].direction,
+                              strip_id,
+                              stu.stop_id,
+                              stu.arrival.time,
+                              stu.departure.time)
+                    tuple_list.append(tup)
+    return tuple_list
 
-    #insert new trips and stations before stops so that we have all required foreign keys
-    insert_new_trips(new_trips,dbconn)
-    insert_new_stations(new_stations,dbconn)
-    #add the newly discovered trips and stations to the global list
-    stations = stations | new_stations
-    trips = trips | new_trips
+#nyct gtfs realtime trip ids have the following general format (via regex)
+#(?P<origin_time>\d+)_(?P<route_id>\w)\.\.(?P<direction>\w)(?P<path_identifier>\w+)
+# origin time, route id and direction are enough to uniquely idenfiy a trip
+# the path identifier is extraneous, and may dissapear during a trip
+# to prevent this from making a single trip appear as many in our db, we will strip it out
+def strip_stop_pattern_from_tripid(trip_id):
+    try:
+        regex = r"(\d+_\w?\.\.\w)\w*"
+        m = re.match(regex, trip_id)
+        return m.group(1)
+    except:
+        print(trip_id)
 
-    statement = '''INSERT OR IGNORE INTO stops (routeid, direction, tripid, stationid, arrivaltime, departuretime) 
-                                        VALUES (?, ?, ?, ?, ?, ?);'''
-    dbconn.executemany(statement, stops)
+def parse_protoQ(protoQ):
+    dbconn = get_db_conn()
+    while True:
+        try:
+            protobuf = protoQ.get(block=False)
+            p = parse_proto(protobuf)
+            if p is not None:
+                list_of_stop_tuples = proto_to_tuple_list(p)
+                save_to_db(list_of_stop_tuples, dbconn)
+            protoQ.task_done()
+        except queue.Empty:
+            #if we ever fail to get here it means the whole queue is empty
+            #because all of the items are pre-populated
+            return
+
+def save_to_db(list_of_stop_tuples, dbconn):
+    stations = set([tup[3] for tup in list_of_stop_tuples])
+    trips = set([tup[2] for tup in list_of_stop_tuples])
+    insert_new_trips(trips, dbconn)
+    insert_new_stations(stations, dbconn)
+    insert_new_stops(list_of_stop_tuples, dbconn)
     dbconn.commit()
 
+def insert_new_stops(stops, dbconn):
+    statement = '''INSERT OR IGNORE INTO stops (routeid,
+                                                direction,
+                                                tripid,
+                                                stationid,
+                                                arrivaltime,
+                                                departuretime) 
+                                            VALUES (?, ?, ?, ?, ?, ?);'''
+    dbconn.executemany(statement, stops)
 
 def insert_new_trips(new_trips, dbconn):
     insert_trips = [(val,) for val in new_trips]
-    dbconn.executemany("INSERT INTO trips (tripid) VALUES (?)", insert_trips)
-    dbconn.commit()
+    dbconn.executemany("INSERT OR IGNORE INTO trips (tripid) VALUES (?)", insert_trips)
 
 def insert_new_stations(new_stations, dbconn):
     insert_stations = [(val,) for val in new_stations]
-
-    dbconn.executemany("INSERT INTO stations (stationid) VALUES (?)", insert_stations)
-    dbconn.commit()
+    dbconn.executemany("INSERT OR IGNORE INTO stations (stationid) VALUES (?)", insert_stations)
 
 
 def parse_and_save(dbconn, file_list):
-    feed_messages = multiprocess_parse(file_list)
-    for i,message in enumerate(feed_messages):
-        if message is not None:
-            save_feed_data(message, dbconn)
-            print("write file", i)
-    dbconn.commit()
-    print(trips)
-    print(stations)
-    print("done")
+    #read all the files into the queue
+    protoQ = mp.JoinableQueue()
+    for p in plist:
+        protoQ.put(p)
+    procs = []
+    for i in range(10):
+        proc = Process(target = parse_protoQ, args=(protoQ,))
+        procs.append(proc)   
+        proc.start()
+    protoQ.join()
+    for proc in procs:
+        proc.join()
 
-        
-#nop if exists, returns connection
+def get_db_conn():
+    return sqlite3.connect('stops.db')
+
+#nop if exists
 def create_database():
-    c = sqlite3.connect('stops.db')
+    c = get_db_conn()
     cursor = c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='stops';")
     f = cursor.fetchone()
     if f is None:
-        c.execute('''CREATE TABLE trips (id INTEGER PRIMARY KEY AUTOINCREMENT,
+        c.execute('''CREATE TABLE trips (id INTEGER PRIMARY KEY,
                                           tripid TEXT UNIQUE)''')
-        c.execute('''CREATE TABLE stations (id INTEGER PRIMARY KEY AUTOINCREMENT,
+        c.execute('''CREATE TABLE stations (id INTEGER PRIMARY KEY ,
                                              stationid TEXT UNIQUE)''')
         c.execute('''CREATE TABLE stops (routeid f,
                                         direction TEXT,
@@ -122,14 +135,17 @@ def create_database():
                                         FOREIGN KEY(stationid) REFERENCES stations(id),
                                         PRIMARY KEY(routeid, direction, stationid, tripid))''')
         c.commit()
-    return c
             
-            
+def read_proto_list(dir):
+    list = sorted(os.listdir(dir))
+    file_list = [os.path.join(dir,f) for f in list]
+    return file_list 
+
 if __name__ == "__main__":
     #calculate data over time
     conn = create_database()
     dir  = "E:\\subway data\\sep\\"
-    plist = read_proto_list(dir)[:100]
+    plist = read_proto_list(dir)
     parse_and_save(conn, plist)
     
 
